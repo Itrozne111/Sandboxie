@@ -1,0 +1,141 @@
+name: Build Driver
+
+env:
+  forbuildVariables: use Installer\buildVariables.cmd file
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Fetch Upstream]
+    types:
+      - completed
+
+jobs:
+  Build_x64:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.1.7
+      - name: Load Variables from buildVariables.cmd
+        shell: cmd
+        run: |
+          @echo on
+          call "${{ github.workspace }}\Installer\buildVariables.cmd" build_qt6
+          echo qt6_version=%qt6_version% >> %GITHUB_ENV%
+          echo qt_version=%qt6_version% >> %GITHUB_ENV%
+      - name: Setup msbuild
+        uses: microsoft/setup-msbuild@v2
+      #
+      # get version number
+      #
+      - name: get version number
+        id: version_number
+        shell: pwsh
+        run: |
+          # prepare authenticated headers to avoid API rate limits for unauthenticated requests
+          $headers = @{
+            'User-Agent' = 'GitHub-Actions'
+            'Accept' = 'application/vnd.github.v3+json'
+          }
+          if ($env:GH_TOKEN) { $headers['Authorization'] = "token $env:GH_TOKEN" }
+
+          # helper to safely call the API and return parsed JSON or $null on failure
+          function Get-GithubReleases($url) {
+            try {
+              $resp = Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -ErrorAction Stop
+              if ($resp -and $resp.Content) {
+                return $resp.Content | ConvertFrom-Json
+              }
+              return $null
+            } catch {
+              # handle API rate limit or other HTTP errors without failing the job
+              $msg = $_.Exception.Message
+              Write-Host "Warning: failed to fetch $url - $msg"
+              return $null
+            }
+          }
+
+          # fetch upstream release tag
+          $response = Get-GithubReleases 'https://api.github.com/repos/sandboxie-plus/sandboxie/releases'
+          if (-not $response -or $response.Count -eq 0) {
+            Write-Host "No upstream releases found or request failed."
+            $SbieVersion_remote = ''
+          } else {
+            $SbieVersion_remote = $response[0].tag_name
+          }
+          Write-Output "SBIEVERSION=$SbieVersion_remote" >> $Env:GITHUB_OUTPUT
+
+          # fetch local (fork) release tag
+          $response = Get-GithubReleases 'https://api.github.com/repos/itrozne111/sandboxie/releases'
+
+          $skip = 'false'
+          if ($response -and $response.Count -gt 0) {
+            $SbieVersion_local = $response[0].tag_name
+            if ($SbieVersion_remote -ne '' -and $SbieVersion_remote -eq $SbieVersion_local) {
+              Write-Host "Upstream and local release tags match. Skipping build and marking run successful."
+              $skip = 'true'
+            }
+          } else {
+            Write-Host "No releases found for itrozne111/sandboxie or request failed. Skipping local comparison."
+          }
+
+          # export skip flag as step output
+          Write-Output "skip=$skip" >> $Env:GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+      #
+      # Patch Driver
+      #
+      - name: patch
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        run: |
+          $verifyc = Get-Content "Sandboxie\core\drv\verify.c" -Raw
+          $func_pos = $verifyc.IndexOf("NTSTATUS KphVerifySignature")
+          $patch_pos = $verifyc.IndexOf("{",$func_pos)
+          $verifyc.Insert($patch_pos + 1,"return 0;") | Out-File -Encoding utf8 "Sandboxie\core\drv\verify.c"
+      #
+      # Compile Sandboxie Driver
+      #
+      - name: Build Sandboxie x64 (driver)
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        run: msbuild /t:build Sandboxie\SandboxDrv.sln /p:Configuration="SbieRelease" /p:Platform=x64 -maxcpucount:8
+
+      - name: Archive
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        shell: pwsh
+        run: Compress-Archive Sandboxie\Bin\* SbieDrv.zip
+
+      - name: hash
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        shell: pwsh
+        run: (Get-FileHash SbieDrv.zip).Hash + "  SbieDrv.zip" | Out-File -Encoding utf8 SbieDrv.zip.sha256
+
+      - name: generate certificate
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        shell: bash
+        run: |
+          echo -e "NAME: Sandboxie Tester\nTYPE: ETERNAL\nDATE: 01.01.1970\nSIGNATURE: b25seSBmb3IgdGVzdCBwdXJwb3Nl" > Certificate.dat
+      #
+      # Release
+      #
+      - name: Release
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            SbieDrv.zip
+            SbieDrv.zip.sha256
+            Certificate.dat
+          token: ${{ secrets.RELEASE_TOKEN }}
+          name: ${{ steps.version_number.outputs.SBIEVERSION}}
+          tag_name: ${{ steps.version_number.outputs.SBIEVERSION}}
+          body: |
+            The SbieDrv.sys with certificate verification patched. You can use it to debug advanced features in test signing mode without actually owning a certificate.
+            An example of Certificate.dat:
+            ```
+            NAME: Sandboxie Tester
+            TYPE: ETERNAL
+            DATE: 01.01.1970
+            SIGNATURE: b25seSBmb3IgdGVzdCBwdXJwb3Nl
+            ```

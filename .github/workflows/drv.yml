@@ -167,8 +167,42 @@ jobs:
           $patched | Out-File -Encoding utf8 "Sandboxie\core\drv\process.c"
           Write-Host "    [OK] process.c patched (+$(($patched.Length - $proc.Length)) chars)"
 
+          # ── process.c (SbieSvc path) — set forced_process=TRUE for host-exe processes started via SbieSvc ──
+          # When a sandboxed process (e.g. GameVault) launches a game via ShellExecuteEx, SbieDll intercepts
+          # and routes creation through SbieSvc, making ParentId == Api_ServiceProcessId in the kernel callback.
+          # This fast-path skips both the parent-inheritance block (parent_was_sandboxed stays FALSE) and the
+          # forced-program check (process_is_forced stays FALSE). Result: the game gets forced_process=FALSE AND
+          # parent_was_sandboxed=FALSE, bypassing all ProtectHostImages exemptions in file_flt.c/process_util.c.
+          #
+          # Fix: append process_is_forced=TRUE after add_process_to_job=TRUE in the SbieSvc block,
+          # located by "// 1.  process created by SbieSvc" + IndexOf to target only that occurrence.
+          Write-Host "==> [process.c SbieSvc path] Searching for SbieSvc block..."
+          $proc2 = Get-Content "Sandboxie\core\drv\process.c" -Raw
+          $svc_comment = '// 1.  process created by SbieSvc'
+          $svc_pos = $proc2.IndexOf($svc_comment)
+          if ($svc_pos -lt 0) {
+            Write-Error "process.c: SbieSvc comment not found - upstream may have changed the SbieSvc block"
+            exit 1
+          }
+          Write-Host "    SbieSvc comment found at char $svc_pos"
+          $apts_target = 'add_process_to_job = TRUE;'
+          $apts_pos = $proc2.IndexOf($apts_target, $svc_pos)
+          if ($apts_pos -lt 0) {
+            Write-Error "process.c: 'add_process_to_job = TRUE;' not found after SbieSvc comment"
+            exit 1
+          }
+          Write-Host "    'add_process_to_job = TRUE;' found at char $apts_pos"
+          $insert_pos = $apts_pos + $apts_target.Length
+          $patched2 = $proc2.Insert($insert_pos, " process_is_forced = TRUE;")
+          if ($patched2 -eq $proc2) {
+            Write-Error "process.c (SbieSvc): Insert produced no change"
+            exit 1
+          }
+          $patched2 | Out-File -Encoding utf8 "Sandboxie\core\drv\process.c"
+          Write-Host "    [OK] process.c SbieSvc path patched (+$(($patched2.Length - $proc2.Length)) chars)"
+
           Write-Host ""
-          Write-Host "All 4 patches applied successfully."
+          Write-Host "All 5 patches applied successfully."
 
       #
       # Build core components

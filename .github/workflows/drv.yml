@@ -1,0 +1,319 @@
+name: Build Sandboxie
+
+env:
+  forbuildVariables: use Installer\buildVariables.cmd file
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: [Fetch Upstream]
+    types:
+      - completed
+
+jobs:
+  Build_x64:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.1.7
+
+      - name: Load Variables from buildVariables.cmd
+        shell: cmd
+        run: |
+          @echo on
+          call "${{ github.workspace }}\Installer\buildVariables.cmd" build_qt6
+          echo qt6_version=%qt6_version% >> %GITHUB_ENV%
+          echo qt_version=%qt6_version% >> %GITHUB_ENV%
+
+      - name: Setup msbuild
+        uses: microsoft/setup-msbuild@v2
+
+      #
+      # get version number
+      #
+      - name: get version number
+        id: version_number
+        shell: pwsh
+        run: |
+          $headers = @{
+            'User-Agent' = 'GitHub-Actions'
+            'Accept' = 'application/vnd.github.v3+json'
+          }
+          if ($env:GH_TOKEN) { $headers['Authorization'] = "token $env:GH_TOKEN" }
+
+          function Get-GithubReleases($url) {
+            try {
+              $resp = Invoke-WebRequest -Uri $url -Headers $headers -UseBasicParsing -ErrorAction Stop
+              if ($resp -and $resp.Content) { return $resp.Content | ConvertFrom-Json }
+              return $null
+            } catch {
+              Write-Host "Warning: failed to fetch $url - $($_.Exception.Message)"
+              return $null
+            }
+          }
+
+          $response = Get-GithubReleases 'https://api.github.com/repos/sandboxie-plus/sandboxie/releases'
+          if (-not $response -or $response.Count -eq 0) {
+            Write-Host "No upstream releases found or request failed."
+            $SbieVersion_remote = ''
+          } else {
+            $SbieVersion_remote = $response[0].tag_name
+          }
+          Write-Output "SBIEVERSION=$SbieVersion_remote" >> $Env:GITHUB_OUTPUT
+
+          $response = Get-GithubReleases 'https://api.github.com/repos/itrozne111/sandboxie/releases'
+          $skip = 'false'
+          if ($response -and $response.Count -gt 0) {
+            $SbieVersion_local = $response[0].tag_name
+            if ($SbieVersion_remote -ne '' -and $SbieVersion_remote -eq $SbieVersion_local) {
+              Write-Host "Upstream and local release tags match. Skipping build."
+              $skip = 'true'
+            }
+          } else {
+            Write-Host "No releases found for itrozne111/sandboxie or request failed. Skipping local comparison."
+          }
+          Write-Output "skip=$skip" >> $Env:GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+      #
+      # Patch source files
+      #
+      - name: patch
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          # ── verify.c — signature bypass ──────────────────────────────────────────
+          Write-Host "==> [verify.c] Searching for 'NTSTATUS KphVerifySignature'..."
+          $verifyc = Get-Content "Sandboxie\core\drv\verify.c" -Raw
+          $func_pos = $verifyc.IndexOf("NTSTATUS KphVerifySignature")
+          if ($func_pos -lt 0) {
+            Write-Error "verify.c: 'NTSTATUS KphVerifySignature' not found - upstream may have changed the function"
+            exit 1
+          }
+          Write-Host "    target found at char $func_pos"
+          $patch_pos = $verifyc.IndexOf("{",$func_pos)
+          Write-Host "    opening brace found at char $patch_pos"
+          $patched = $verifyc.Insert($patch_pos + 1,"return 0;")
+          if ($patched -eq $verifyc) {
+            Write-Error "verify.c: Insert produced no change - check patch logic"
+            exit 1
+          }
+          $patched | Out-File -Encoding utf8 "Sandboxie\core\drv\verify.c"
+          Write-Host "    [OK] verify.c patched (+$(($patched.Length - $verifyc.Length)) chars)"
+
+          # ── process_util.c — exempt ForceFolder/inherited sandbox from ProtectHostImages (DuplicateHandle) ──
+          # Fixes DuplicateHandle failures (Steam IPC) for games run via ForceFolder or inherited sandbox.
+          # Exempts both directly-forced processes (forced_process=TRUE) and children of sandboxed parents
+          # (parent_was_sandboxed=TRUE, set when the process inherited its box rather than being directly forced).
+          Write-Host "==> [process_util.c] Searching for patch target..."
+          $util = Get-Content "Sandboxie\core\drv\process_util.c" -Raw
+          $old = '!proc2->image_from_box && proc2->protect_host_images && proc->image_from_box'
+          $new = '!proc2->image_from_box && !proc2->forced_process && !proc2->parent_was_sandboxed && proc2->protect_host_images && proc->image_from_box'
+          if (-not $util.Contains($old)) {
+            Write-Error "process_util.c: patch target not found - upstream may have changed the condition"
+            exit 1
+          }
+          Write-Host "    target found"
+          $patched = $util.Replace($old, $new)
+          if ($patched -eq $util) {
+            Write-Error "process_util.c: Replace produced no change - target was found but substitution failed"
+            exit 1
+          }
+          $patched | Out-File -Encoding utf8 "Sandboxie\core\drv\process_util.c"
+          Write-Host "    [OK] process_util.c patched (+$(($patched.Length - $util.Length)) chars)"
+
+          # ── file_flt.c — exempt ForceFolder/inherited sandbox from ProtectHostImages image load (SBIE1305) ──
+          # Fixes SBIE1305 for both directly-forced (forced_process=TRUE) and inherited-sandbox
+          # (parent_was_sandboxed=TRUE) host-exe processes loading sandboxed DLLs (e.g. Steam overlay).
+          # parent_was_sandboxed is set in process.c when a process inherits its box from a sandboxed parent
+          # instead of being directly matched by ForceFolder/ForceProgram.
+          Write-Host "==> [file_flt.c] Searching for patch target..."
+          $flt = Get-Content "Sandboxie\core\drv\file_flt.c" -Raw
+          $old = '!proc->image_from_box && proc->protect_host_images && Data->Iopb->TargetFileObject'
+          $new = '!proc->image_from_box && !proc->forced_process && !proc->parent_was_sandboxed && proc->protect_host_images && Data->Iopb->TargetFileObject'
+          if (-not $flt.Contains($old)) {
+            Write-Error "file_flt.c: patch target not found - upstream may have changed the condition"
+            exit 1
+          }
+          Write-Host "    target found"
+          $patched = $flt.Replace($old, $new)
+          if ($patched -eq $flt) {
+            Write-Error "file_flt.c: Replace produced no change - target was found but substitution failed"
+            exit 1
+          }
+          $patched | Out-File -Encoding utf8 "Sandboxie\core\drv\file_flt.c"
+          Write-Host "    [OK] file_flt.c patched (+$(($patched.Length - $flt.Length)) chars)"
+
+          # ── process.c — propagate forced_process to children of forced parents ──
+          # When a child process inherits its sandbox box from a forced (ForceFolder) parent,
+          # it also inherits forced_process=TRUE so that the file_flt.c and process_util.c
+          # patches correctly exempt it from ProtectHostImages restrictions.
+          Write-Host "==> [process.c] Searching for patch target..."
+          $proc = Get-Content "Sandboxie\core\drv\process.c" -Raw
+          $old = 'if (parent_proc->is_start_exe)'
+          $new = 'if (parent_proc->forced_process) process_is_forced = TRUE; if (parent_proc->is_start_exe)'
+          if (-not $proc.Contains($old)) {
+            Write-Error "process.c: patch target not found - upstream may have changed the parent inheritance block"
+            exit 1
+          }
+          Write-Host "    target found"
+          $patched = $proc.Replace($old, $new)
+          if ($patched -eq $proc) {
+            Write-Error "process.c: Replace produced no change - target was found but substitution failed"
+            exit 1
+          }
+          $patched | Out-File -Encoding utf8 "Sandboxie\core\drv\process.c"
+          Write-Host "    [OK] process.c patched (+$(($patched.Length - $proc.Length)) chars)"
+
+          Write-Host ""
+          Write-Host "All 4 patches applied successfully."
+
+      #
+      # Build core components
+      #
+      - name: Build Sandboxie x86 (core DLLs and services)
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        run: msbuild /t:build Sandboxie\SandboxDll.sln /p:Configuration="SbieRelease" /p:Platform=Win32 -maxcpucount:8
+
+      - name: Build Sandboxie x64 (core suite)
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        run: msbuild /t:build Sandboxie\Sandbox.sln /p:Configuration="SbieRelease" /p:Platform=x64 -maxcpucount:8
+
+      - name: Build Sandboxie x64 (driver)
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        run: msbuild /t:build Sandboxie\SandboxDrv.sln /p:Configuration="SbieRelease" /p:Platform=x64 -maxcpucount:8
+
+      #
+      # Build Sandboxie Plus UI
+      #
+      - name: Install Qt6
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        shell: cmd
+        run: |
+          call SandboxiePlus\install_qt.cmd x64
+          call SandboxiePlus\install_jom.cmd
+
+      - name: Build Sandman UI
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        shell: cmd
+        run: call SandboxiePlus\qmake_plus.cmd x64 build_qt6
+
+      - name: Restore NuGet packages (SbieShell)
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        run: nuget restore SandboxiePlus\SbieShell\SbieShell.sln
+
+      - name: Build SbieShell
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        run: msbuild /t:build SandboxiePlus\SbieShell\SbieShell.sln /p:Configuration="Release" /p:Platform=x64 -maxcpucount:8
+
+      - name: Build SandboxieTools
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        run: msbuild /t:build SandboxieTools\SandboxieTools.sln /p:Configuration="Release" /p:Platform=x64 -maxcpucount:8
+
+      #
+      # Assemble release files
+      #
+      - name: Assemble release files
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        shell: cmd
+        run: |
+          call Installer\fix_qt5_languages.cmd x64 build_qt6
+          call Installer\get_openssl.cmd
+          call Installer\get_7zip.cmd
+          call Installer\copy_build.cmd x64 build_qt6
+
+      - name: Copy extra driver files to release folder
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          # copy_build.cmd omits SbieMsg.pdb — copy it so it appears in Sandboxie-Plus-x64.zip too
+          $bin = "Sandboxie\Bin\x64\SbieRelease"
+          $dst = "Installer\SbiePlus_x64"
+          @("SbieMsg.pdb") | ForEach-Object {
+            if (Test-Path "$bin\$_") { Copy-Item "$bin\$_" $dst; Write-Host "Copied $_" }
+            else { Write-Host "$_ not found in $bin, skipping" }
+          }
+
+      - name: Copy signing certificate to release folder
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          # Copy any .cer signing certificate from driver build output into the assembled release folder
+          # so it appears in both SbieDrv.zip and Sandboxie-Plus-x64.zip
+          Get-ChildItem "Sandboxie\Bin\x64\SbieRelease\*.cer" | ForEach-Object {
+            Copy-Item $_.FullName "Installer\SbiePlus_x64\"; Write-Host "Copied $($_.Name)"
+          }
+
+      - name: Strip user INI files from release
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          'Sandboxie.ini','SbieSettings.ini','Sandboxie-Plus.ini' | ForEach-Object {
+            $f = "Installer\SbiePlus_x64\$_"
+            if (Test-Path $f) { Remove-Item $f; Write-Host "Removed $_" }
+            else { Write-Host "$_ not present, skipping" }
+          }
+
+      - name: Archive driver only
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          # Source from raw build output — includes SbieMsg.pdb which copy_build.cmd omits
+          $src = "Sandboxie\Bin\x64\SbieRelease"
+          $candidates = @("$src\SbieDrv.sys","$src\SbieDrv.pdb","$src\SbieMsg.dll","$src\SbieMsg.pdb")
+          $files = $candidates | Where-Object { Test-Path $_ }
+          $files += Get-ChildItem "$src\*.cer" | Select-Object -ExpandProperty FullName
+          Compress-Archive -Path $files -DestinationPath SbieDrv.zip
+
+      - name: Archive full build
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        shell: pwsh
+        run: Compress-Archive Installer\SbiePlus_x64\* Sandboxie-Plus-x64.zip
+
+      - name: Hash driver archive
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        shell: pwsh
+        run: (Get-FileHash SbieDrv.zip).Hash + "  SbieDrv.zip" | Out-File -Encoding utf8 SbieDrv.zip.sha256
+
+      - name: generate certificate
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        shell: bash
+        run: |
+          echo -e "NAME: Sandboxie Tester\nTYPE: ETERNAL\nDATE: 01.01.1970\nSIGNATURE: b25seSBmb3IgdGVzdCBwdXJwb3Nl" > Certificate.dat
+
+      #
+      # Release
+      #
+      - name: Release
+        if: ${{ steps.version_number.outputs.skip != 'true' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            SbieDrv.zip
+            SbieDrv.zip.sha256
+            Sandboxie-Plus-x64.zip
+            Certificate.dat
+          token: ${{ secrets.RELEASE_TOKEN }}
+          name: ${{ steps.version_number.outputs.SBIEVERSION }}
+          tag_name: ${{ steps.version_number.outputs.SBIEVERSION }}
+          body: |
+            Sandboxie-Plus patched build based on upstream ${{ steps.version_number.outputs.SBIEVERSION }}.
+
+            **Patches applied:**
+            - `verify.c`: signature verification bypassed for test-signing mode
+            - `process_util.c`: ForceFolder processes exempt from ProtectHostImages restriction (fixes Steam IPC DuplicateHandle failures)
+            - `file_flt.c`: ForceFolder processes exempt from sandboxed image load block (fixes SBIE1305 for games run via ForceFolder)
+
+            **Downloads:**
+            - `Sandboxie-Plus-x64.zip` — full installation (Sandman UI + all components)
+            - `SbieDrv.zip` — driver only, for updating an existing installation
+
+            **Certificate.dat example** (for test-signing mode):
+            ```
+            NAME: Sandboxie Tester
+            TYPE: ETERNAL
+            DATE: 01.01.1970
+            SIGNATURE: b25seSBmb3IgdGVzdCBwdXJwb3Nl
+            ```
